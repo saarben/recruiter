@@ -13,6 +13,8 @@ import pandas as pd
 # Text extraction libs
 from pypdf import PdfReader
 import docx2txt
+from pdfminer.high_level import extract_text as pdfminer_extract_text
+import fitz  # PyMuPDF
 
 # Optional: OpenAI
 USE_LLM_DEFAULT = True
@@ -45,6 +47,12 @@ STOPWORDS = {
     "qualifications", "experience", "skills", "years", "year", "nice", "plus", "bonus",
 }
 
+SYMBOLIC_EQUIVALENTS: Dict[str, list[str]] = {
+    "c++": ["c++", "cpp"],
+    "c#": ["c#", "csharp"],
+    "node.js": ["node.js", "nodejs", "node"],
+}
+
 JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -63,14 +71,48 @@ JSON_SCHEMA = {
 
 @st.cache_data(show_spinner=False)
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(file_bytes))
-    text = []
-    for page in reader.pages:
+    # First try pypdf
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        text = []
+        for page in reader.pages:
+            try:
+                txt = page.extract_text() or ""
+                if txt:
+                    text.append(txt)
+            except Exception:
+                pass
+        combined = "\n".join(text).strip()
+        if combined:
+            return combined
+    except Exception:
+        pass
+    # Fallback to pdfminer.six
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
         try:
-            text.append(page.extract_text() or "")
-        except Exception:
-            pass
-    return "\n".join(text)
+            mined = pdfminer_extract_text(tmp_path) or ""
+            if mined.strip():
+                return mined
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Fallback to PyMuPDF
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        parts: list[str] = []
+        for page in doc:
+            parts.append(page.get_text("text") or "")
+        text = "\n".join(parts).strip()
+        return text
+    except Exception:
+        return ""
 
 @st.cache_data(show_spinner=False)
 def extract_text_from_docx(file_bytes: bytes) -> str:
@@ -129,7 +171,13 @@ def heuristic_score(text: str, keywords: List[str], job_desc: str) -> Dict[str, 
             seen.add(k)
 
     def count_hits(target_text: str, term: str) -> int:
-        return len(re.findall(rf"\\b{re.escape(term)}\\b", target_text, flags=re.IGNORECASE))
+        # Support symbolic equivalents and escape regex special chars
+        candidates: list[str] = SYMBOLIC_EQUIVALENTS.get(term.lower(), [term])
+        total = 0
+        for cand in candidates:
+            pattern = re.escape(cand)
+            total += len(re.findall(rf"(?<!\w){pattern}(?!\w)", target_text, flags=re.IGNORECASE))
+        return total
 
     default_hits_total = sum(count_hits(text, k) for k in keywords)
     jd_unique_hits = sum(1 for k in jd_keywords if count_hits(text, k) > 0)
