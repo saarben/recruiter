@@ -107,6 +107,18 @@ def fetch_jd_from_url(url: str, timeout: float = 10.0) -> str:
     except Exception as e:
         return f"(Failed to fetch JD from URL: {e})"
 
+def _on_jd_url_change():
+    url = st.session_state.get("jd_url", "").strip()
+    if not url:
+        st.session_state["jd_fetch_status"] = ""
+        return
+    fetched = fetch_jd_from_url(url)
+    if fetched.startswith("(Failed to fetch JD"):
+        st.session_state["jd_fetch_status"] = fetched
+    else:
+        st.session_state["job_desc"] = fetched
+        st.session_state["jd_fetch_status"] = "Fetched JD from URL and populated the text area."
+
 # LLM client factory: supports OpenAI (default) or Groq SDK
 def create_llm_client():
     groq_key = os.getenv("GROQ_API_KEY")
@@ -414,16 +426,19 @@ with st.sidebar:
 st.subheader("Job Description")
 jd_col1, jd_col2 = st.columns([3, 1])
 with jd_col1:
-    job_desc = st.text_area("Paste the role description / must-haves / nice-to-haves", height=200)
+    job_desc = st.text_area(
+        "Paste the role description / must-haves / nice-to-haves",
+        height=200,
+        key="job_desc",
+    )
 with jd_col2:
-    jd_url = st.text_input("Or paste JD URL")
-    if jd_url:
-        fetched = fetch_jd_from_url(jd_url)
-        if fetched.startswith("(Failed to fetch JD"):
-            st.warning(fetched)
+    st.text_input("Or paste JD URL", key="jd_url", on_change=_on_jd_url_change)
+    status = st.session_state.get("jd_fetch_status")
+    if status:
+        if status.startswith("(Failed"):
+            st.warning(status)
         else:
-            st.success("Fetched JD from URL. Populated the text area.")
-            job_desc = fetched
+            st.success(status)
 
 uploads = st.file_uploader("Upload candidate CVs (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"], accept_multiple_files=True)
 ref_uploads = st.file_uploader("Upload reference CVs (strong existing team members)", type=["pdf", "docx", "txt"], accept_multiple_files=True, key="ref")
