@@ -244,11 +244,34 @@ def heuristic_score(text: str, keywords: List[str], job_desc: str) -> Dict[str, 
     }
 
 def ensure_json(text: str) -> Dict[str, Any]:
-    # Try to extract JSON from the model response even if there is extra text
-    m = re.search(r"\{[\s\S]*\}$", text.strip())
+    """Parse JSON from model output, tolerating extra text and code fences."""
+    if text is None:
+        raise ValueError("Empty model response")
+    s = text.strip()
+    # Prefer fenced JSON blocks
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, flags=re.IGNORECASE)
+    if fence:
+        candidate = fence.group(1).strip()
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+    # Trailing object from the end
+    m = re.search(r"\{[\s\s]*\}$", s)
     if m:
-        text = m.group(0)
-    return json.loads(text)
+        candidate = m.group(0)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+    # Broad: slice from first { to last }
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = s[start:end + 1]
+        return json.loads(candidate)
+    # Last resort: parse as-is
+    return json.loads(s)
 
 # LLM call using OpenAI-compatible client (OpenAI or Groq)
 def call_openai(job_desc: str, resume_text: str, weights: Dict[str, int], model: str) -> Dict[str, Any]:
@@ -286,8 +309,9 @@ Return a JSON with keys: name (if present), overall_score (0-100), fit_reasoning
                     {"role": "user", "content": user},
                 ],
                 temperature=0.1,
+                response_format={"type": "json_object"},
             )
-            raw = resp.choices[0].message.content
+            raw = resp.choices[0].message.content or ""
         else:
             # OpenAI client
             resp = client.chat.completions.create(
@@ -299,7 +323,7 @@ Return a JSON with keys: name (if present), overall_score (0-100), fit_reasoning
                 ],
                 temperature=0.1,
             )
-            raw = resp.choices[0].message.content
+            raw = resp.choices[0].message.content or ""
         return ensure_json(raw)
     except Exception as e:
         # Best-effort fallback: return a heuristic result
