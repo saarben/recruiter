@@ -10,7 +10,7 @@ import streamlit as st
 import pandas as pd
 
 # Text extraction libs
-from PyPDF2 import PdfReader
+from pypdf import PdfReader
 import docx2txt
 
 # Optional: OpenAI
