@@ -38,10 +38,7 @@ except Exception:
 import httpx
 from bs4 import BeautifulSoup
 
-MODEL_DEFAULT = (
-    os.getenv("CV_SCREENER_MODEL")
-    or ("llama3-8b-8192" if os.getenv("GROQ_API_KEY") else "gpt-4o-mini")
-)
+MIN_JD_CHARS = 80
 
 def _extract_main_text_from_html(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -117,8 +114,18 @@ def fetch_jd_from_url(url: str, timeout: float = 10.0) -> str:
             content_type = resp.headers.get("content-type", "")
             text = resp.text
         if "html" in content_type.lower() or "<html" in text.lower():
-            cleaned = _extract_main_text_from_html(text)
-            return cleaned[:20000]
+            cleaned = _extract_main_text_from_html(text).strip()
+            if len(cleaned) >= MIN_JD_CHARS:
+                return cleaned[:20000]
+            # Fallback: simple page text (less aggressive cleaning)
+            soup = BeautifulSoup(text, "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            page_text = soup.get_text(separator="\n")
+            simple_clean = "\n".join(line.strip() for line in page_text.splitlines() if line.strip()).strip()
+            if len(simple_clean) >= MIN_JD_CHARS:
+                return simple_clean[:20000]
+            return "(Failed to fetch JD from URL: page content appears empty or script-rendered)"
         return text[:20000]
     except Exception as e:
         return f"(Failed to fetch JD from URL: {e})"
@@ -129,7 +136,7 @@ def _on_jd_url_change():
         st.session_state["jd_fetch_status"] = ""
         return
     fetched = fetch_jd_from_url(url)
-    if fetched.startswith("(Failed to fetch JD"):
+    if fetched.startswith("(Failed to fetch JD") or not fetched.strip():
         st.session_state["jd_fetch_status"] = fetched
     else:
         st.session_state["job_desc"] = fetched
