@@ -5,6 +5,7 @@ import json
 import time
 import base64
 from typing import List, Dict, Any
+import tempfile
 
 import streamlit as st
 import pandas as pd
@@ -36,6 +37,14 @@ KEYWORD_DEFAULTS = [
     "python", "c++", "ros", "linux", "cuda", "ml", "cv", "docker", "kubernetes",
 ]
 
+STOPWORDS = {
+    "the", "and", "or", "for", "with", "you", "your", "our", "we", "they", "a", "an", "to",
+    "in", "of", "on", "at", "as", "by", "is", "are", "be", "this", "that", "from", "will",
+    "have", "has", "had", "it", "but", "if", "not", "can", "may", "must", "should", "more",
+    "less", "about", "using", "use", "used", "preferred", "required", "responsibilities",
+    "qualifications", "experience", "skills", "years", "year", "nice", "plus", "bonus",
+}
+
 JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -65,9 +74,16 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 @st.cache_data(show_spinner=False)
 def extract_text_from_docx(file_bytes: bytes) -> str:
-    with open("/tmp/_tmp.docx", "wb") as f:
-        f.write(file_bytes)
-    return docx2txt.process("/tmp/_tmp.docx") or ""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+    try:
+        return docx2txt.process(tmp_path) or ""
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 def extract_text(upload) -> str:
     name = upload.name.lower()
@@ -86,22 +102,70 @@ def scrub_pii(text: str) -> str:
         scrubbed = re.sub(pat, "[REDACTED]", scrubbed, flags=re.IGNORECASE)
     return scrubbed
 
-def heuristic_score(text: str, keywords: List[str]) -> Dict[str, Any]:
-    # Super simple baseline: count keyword matches and estimate years exp by regex
-    kw_hits = sum(len(re.findall(rf"\\b{re.escape(k)}\\b", text, flags=re.IGNORECASE)) for k in keywords)
+def heuristic_score(text: str, keywords: List[str], job_desc: str) -> Dict[str, Any]:
+    """Heuristic scoring that incorporates JD terms.
+
+    - Extracts salient keywords from the job description
+    - Counts unique JD term matches and default keyword hits in the resume
+    - Combines JD matches, defaults, and years of experience into a 0-100 score
+    """
+    def tokenize_keywords(source_text: str) -> List[str]:
+        tokens = re.findall(r"[A-Za-z][A-Za-z0-9+\-#\.]{1,}", source_text.lower())
+        filtered = [t for t in tokens if t not in STOPWORDS and len(t) >= 3]
+        # frequency order, most common first
+        freqs: Dict[str, int] = {}
+        for t in filtered:
+            freqs[t] = freqs.get(t, 0) + 1
+        # keep top N distinct
+        top = sorted(freqs.items(), key=lambda kv: kv[1], reverse=True)
+        return [k for k, _ in top[:30]]
+
+    jd_keywords: List[str] = tokenize_keywords(job_desc) if job_desc else []
+    combined_keywords: List[str] = []
+    seen: set[str] = set()
+    for k in (jd_keywords + keywords):
+        if k not in seen:
+            combined_keywords.append(k)
+            seen.add(k)
+
+    def count_hits(target_text: str, term: str) -> int:
+        return len(re.findall(rf"\\b{re.escape(term)}\\b", target_text, flags=re.IGNORECASE))
+
+    default_hits_total = sum(count_hits(text, k) for k in keywords)
+    jd_unique_hits = sum(1 for k in jd_keywords if count_hits(text, k) > 0)
+    jd_total_hits = sum(count_hits(text, k) for k in jd_keywords)
+
     year_hits = re.findall(r"(\d{1,2})\+?\s*(?:years|yrs)", text, flags=re.IGNORECASE)
     years = max([int(y) for y in year_hits], default=0)
-    score = min(100, kw_hits * 10 + min(40, years * 4))
+
+    # Weighted components: JD emphasis
+    jd_component = min(50, jd_unique_hits * 5)  # up to 50
+    default_component = min(30, default_hits_total * 3)  # up to 30
+    years_component = min(20, years * 4)  # up to 20
+    score = min(100, jd_component + default_component + years_component)
+
     rec = "no"
-    if score >= 85: rec = "strong yes"
-    elif score >= 70: rec = "yes"
-    elif score >= 55: rec = "maybe"
+    if score >= 85:
+        rec = "strong yes"
+    elif score >= 70:
+        rec = "yes"
+    elif score >= 55:
+        rec = "maybe"
+
+    matched_jd_terms = [k for k in jd_keywords if count_hits(text, k) > 0][:10]
+
     return {
         "name": "(unknown)",
         "overall_score": score,
-        "fit_reasoning": f"Keyword hits: {kw_hits}. Estimated years: {years}.",
-        "pros": [f"{kw_hits} relevant keyword hits"],
-        "cons": ["Heuristic only; may miss nuance"],
+        "fit_reasoning": (
+            f"JD unique term matches: {jd_unique_hits}/{len(jd_keywords)}; "
+            f"JD total hits: {jd_total_hits}; Default keyword hits: {default_hits_total}; "
+            f"Estimated years: {years}."
+        ),
+        "pros": [
+            f"Matched JD terms: {', '.join(matched_jd_terms)}" if matched_jd_terms else "Some baseline keyword matches",
+        ],
+        "cons": ["Heuristic; may miss nuanced fit"],
         "hire_recommendation": rec,
         "risk_flags": [],
         "years_experience": years,
@@ -153,7 +217,7 @@ Return a JSON with keys: name (if present), overall_score (0-100), fit_reasoning
     except Exception as e:
         # Best-effort fallback: return a heuristic result
         return {
-            **heuristic_score(resume_text, KEYWORD_DEFAULTS),
+            **heuristic_score(resume_text, KEYWORD_DEFAULTS, job_desc),
             "fit_reasoning": f"LLM call failed ({e}); used heuristic.",
         }
 
@@ -206,7 +270,7 @@ if run:
                     if use_llm and OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY"):
                         r = call_openai(job_desc, resume_text, weights, model)
                     else:
-                        r = heuristic_score(resume_text, KEYWORD_DEFAULTS)
+                        r = heuristic_score(resume_text, KEYWORD_DEFAULTS, job_desc)
                     r["file"] = upload.name
                     results.append(r)
                 except Exception as e:
