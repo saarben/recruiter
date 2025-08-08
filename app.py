@@ -14,7 +14,11 @@ import pandas as pd
 from pypdf import PdfReader
 import docx2txt
 from pdfminer.high_level import extract_text as pdfminer_extract_text
-import fitz  # PyMuPDF
+try:
+    import fitz  # PyMuPDF
+    FITZ_AVAILABLE = True
+except Exception:
+    FITZ_AVAILABLE = False
 
 # Optional: OpenAI-compatible client (OpenAI or Groq via base_url)
 USE_LLM_DEFAULT = True
@@ -121,16 +125,18 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
                 pass
     except Exception:
         pass
-    # Fallback to PyMuPDF
-    try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        parts: list[str] = []
-        for page in doc:
-            parts.append(page.get_text("text") or "")
-        text = "\n".join(parts).strip()
-        return text
-    except Exception:
-        return ""
+    # Fallback to PyMuPDF if available
+    if FITZ_AVAILABLE:
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            parts: list[str] = []
+            for page in doc:
+                parts.append(page.get_text("text") or "")
+            text = "\n".join(parts).strip()
+            return text
+        except Exception:
+            return ""
+    return ""
 
 @st.cache_data(show_spinner=False)
 def extract_text_from_docx(file_bytes: bytes) -> str:
