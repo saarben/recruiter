@@ -38,53 +38,70 @@ except Exception:
 import httpx
 from bs4 import BeautifulSoup
 
-MODEL_DEFAULT = (
-    os.getenv("CV_SCREENER_MODEL")
-    or ("llama3-8b-8192" if os.getenv("GROQ_API_KEY") else "gpt-4o-mini")
-)
+def _extract_main_text_from_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    # Remove non-content elements
+    for tag in soup(["script", "style", "noscript", "svg", "picture", "iframe"]):
+        tag.decompose()
+    # Remove common boilerplate containers
+    selectors = [
+        "header", "footer", "nav", "aside", "form",
+        "[role='navigation']", "[role='banner']", "[role='contentinfo']",
+        ".nav", ".navbar", ".header", ".footer", ".cookie", ".cookies", ".banner",
+        "#navbar", "#header", "#footer", ".subscribe", ".social", ".sidebar",
+        ".menu", ".breadcrumb", ".breadcrumbs",
+    ]
+    for sel in selectors:
+        for el in soup.select(sel):
+            el.decompose()
 
-st.set_page_config(page_title="CV Screener", page_icon="📄", layout="wide")
+    candidates = soup.select("article, main, section, div") or [soup]
+    best_text = ""
+    best_score = -1
+    keywords = [
+        "responsibilities", "requirements", "qualifications", "job description",
+        "what you'll do", "what you will do", "about the role", "about you",
+    ]
+    for el in candidates:
+        txt = el.get_text(separator="\n", strip=True)
+        if not txt:
+            continue
+        score = len(txt)
+        lower = txt.lower()
+        if any(k in lower for k in keywords):
+            score += 1000
+        if score > best_score:
+            best_score = score
+            best_text = txt
 
-# ---------------------- Helpers ----------------------
-PII_PATTERNS = [
-    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",  # email
-    r"\b\+?\d[\d\s().-]{7,}\b",                      # phone-ish
-    r"https?://\S+",                                    # urls
-]
-
-KEYWORD_DEFAULTS = [
-    "python", "c++", "ros", "linux", "cuda", "ml", "cv", "docker", "kubernetes",
-]
-
-STOPWORDS = {
-    "the", "and", "or", "for", "with", "you", "your", "our", "we", "they", "a", "an", "to",
-    "in", "of", "on", "at", "as", "by", "is", "are", "be", "this", "that", "from", "will",
-    "have", "has", "had", "it", "but", "if", "not", "can", "may", "must", "should", "more",
-    "less", "about", "using", "use", "used", "preferred", "required", "responsibilities",
-    "qualifications", "experience", "skills", "years", "year", "nice", "plus", "bonus",
-}
-
-SYMBOLIC_EQUIVALENTS: Dict[str, list[str]] = {
-    "c++": ["c++", "cpp"],
-    "c#": ["c#", "csharp"],
-    "node.js": ["node.js", "nodejs", "node"],
-}
-
-JSON_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "overall_score": {"type": "number"},
-        "fit_reasoning": {"type": "string"},
-        "pros": {"type": "array", "items": {"type": "string"}},
-        "cons": {"type": "array", "items": {"type": "string"}},
-        "hire_recommendation": {"type": "string", "enum": ["strong yes", "yes", "maybe", "no"]},
-        "risk_flags": {"type": "array", "items": {"type": "string"}},
-        "years_experience": {"type": "number"}
-    },
-    "required": ["overall_score", "hire_recommendation"],
-    "additionalProperties": True
-}
+    text = best_text or soup.get_text(separator="\n", strip=True)
+    if not text:
+        return ""
+    # Remove template placeholders like {{position.name}}
+    text = re.sub(r"\{\{[^{}]+\}\}", "", text)
+    # Normalize and filter lines
+    lines = []
+    seen = set()
+    boilerplate = {
+        "all jobs", "terms & policies", "cookies", "apply for this job",
+        "contact us", "we're sorry", "thanks for your interest",
+    }
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low in boilerplate:
+            continue
+        if len(line) < 4 and not (line.startswith(("- ", "* ", "•", "–"))):
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
 
 def fetch_jd_from_url(url: str, timeout: float = 10.0) -> str:
     try:
@@ -95,13 +112,7 @@ def fetch_jd_from_url(url: str, timeout: float = 10.0) -> str:
             content_type = resp.headers.get("content-type", "")
             text = resp.text
         if "html" in content_type.lower() or "<html" in text.lower():
-            soup = BeautifulSoup(text, "html.parser")
-            # Remove scripts/styles
-            for tag in soup(["script", "style", "noscript"]):
-                tag.decompose()
-            page_text = soup.get_text(separator="\n")
-            # Normalize whitespace
-            cleaned = "\n".join(line.strip() for line in page_text.splitlines() if line.strip())
+            cleaned = _extract_main_text_from_html(text)
             return cleaned[:20000]
         return text[:20000]
     except Exception as e:
@@ -389,6 +400,49 @@ Return a JSON with keys: name (if present), overall_score (0-100), fit_reasoning
         }
 
 # ---------------------- UI ----------------------
+st.set_page_config(page_title="CV Screener", page_icon="📄", layout="wide")
+
+# ---------------------- Helpers ----------------------
+PII_PATTERNS = [
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",  # email
+    r"\b\+?\d[\d\s().-]{7,}\b",                      # phone-ish
+    r"https?://\S+",                                    # urls
+]
+
+KEYWORD_DEFAULTS = [
+    "python", "c++", "ros", "linux", "cuda", "ml", "cv", "docker", "kubernetes",
+]
+
+STOPWORDS = {
+    "the", "and", "or", "for", "with", "you", "your", "our", "we", "they", "a", "an", "to",
+    "in", "of", "on", "at", "as", "by", "is", "are", "be", "this", "that", "from", "will",
+    "have", "has", "had", "it", "but", "if", "not", "can", "may", "must", "should", "more",
+    "less", "about", "using", "use", "used", "preferred", "required", "responsibilities",
+    "qualifications", "experience", "skills", "years", "year", "nice", "plus", "bonus",
+}
+
+SYMBOLIC_EQUIVALENTS: Dict[str, list[str]] = {
+    "c++": ["c++", "cpp"],
+    "c#": ["c#", "csharp"],
+    "node.js": ["node.js", "nodejs", "node"],
+}
+
+JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "overall_score": {"type": "number"},
+        "fit_reasoning": {"type": "string"},
+        "pros": {"type": "array", "items": {"type": "string"}},
+        "cons": {"type": "array", "items": {"type": "string"}},
+        "hire_recommendation": {"type": "string", "enum": ["strong yes", "yes", "maybe", "no"]},
+        "risk_flags": {"type": "array", "items": {"type": "string"}},
+        "years_experience": {"type": "number"}
+    },
+    "required": ["overall_score", "hire_recommendation"],
+    "additionalProperties": True
+}
+
 st.title("📄 CV Screener")
 
 with st.sidebar:
