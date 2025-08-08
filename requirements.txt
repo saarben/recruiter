@@ -1,5 +1,5 @@
 streamlit==1.37.0
-pandas==2.2.2
+pandas==2.2.3
 pypdf==3.17.4
 pdfminer.six==20231228
 docx2txt==0.8
