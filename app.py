@@ -280,7 +280,6 @@ Return a JSON with keys: name (if present), overall_score (0-100), fit_reasoning
                     {"role": "user", "content": user},
                 ],
                 temperature=0.1,
-                response_format={"type": "json_object"},
             )
             raw = resp.choices[0].message.content
         else:
