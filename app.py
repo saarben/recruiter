@@ -16,7 +16,7 @@ import docx2txt
 from pdfminer.high_level import extract_text as pdfminer_extract_text
 import fitz  # PyMuPDF
 
-# Optional: OpenAI
+# Optional: OpenAI-compatible client (OpenAI or Groq via base_url)
 USE_LLM_DEFAULT = True
 try:
     from openai import OpenAI
@@ -24,7 +24,16 @@ try:
 except Exception:
     OPENAI_AVAILABLE = False
 
-MODEL_DEFAULT = os.getenv("CV_SCREENER_MODEL", "gpt-4o-mini")
+try:
+    from groq import Groq
+    GROQ_SDK_AVAILABLE = True
+except Exception:
+    GROQ_SDK_AVAILABLE = False
+
+MODEL_DEFAULT = (
+    os.getenv("CV_SCREENER_MODEL")
+    or ("llama3-8b-8192" if os.getenv("GROQ_API_KEY") else "gpt-4o-mini")
+)
 
 st.set_page_config(page_title="CV Screener", page_icon="📄", layout="wide")
 
@@ -68,6 +77,15 @@ JSON_SCHEMA = {
     "required": ["overall_score", "hire_recommendation"],
     "additionalProperties": True
 }
+
+# LLM client factory: supports OpenAI (default) or Groq SDK
+def create_llm_client():
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key and GROQ_SDK_AVAILABLE:
+        return Groq(api_key=groq_key)
+    if OPENAI_AVAILABLE:
+        return OpenAI()
+    raise RuntimeError("No available LLM client. Install 'openai' or 'groq'.")
 
 @st.cache_data(show_spinner=False)
 def extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -226,11 +244,12 @@ def ensure_json(text: str) -> Dict[str, Any]:
         text = m.group(0)
     return json.loads(text)
 
+# LLM call using OpenAI-compatible client (OpenAI or Groq)
 def call_openai(job_desc: str, resume_text: str, weights: Dict[str, int], model: str) -> Dict[str, Any]:
     if not OPENAI_AVAILABLE:
-        raise RuntimeError("OpenAI SDK not available. Install 'openai' and try again.")
-    client = OpenAI()
-
+        # We'll still allow Groq path even if OpenAI is missing
+        if not (os.getenv("GROQ_API_KEY") and GROQ_SDK_AVAILABLE):
+            raise RuntimeError("OpenAI SDK not available. Install 'openai' or set GROQ_API_KEY.")
     rubric = {
         "impact_weight": weights.get("impact", 25),
         "skills_weight": weights.get("skills", 25),
@@ -251,16 +270,31 @@ Return a JSON with keys: name (if present), overall_score (0-100), fit_reasoning
 """
 
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.1,
-        )
-        raw = resp.choices[0].message.content
+        client = create_llm_client()
+        # If Groq client
+        if isinstance(client, Groq):
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            raw = resp.choices[0].message.content
+        else:
+            # OpenAI client
+            resp = client.chat.completions.create(
+                model=model,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.1,
+            )
+            raw = resp.choices[0].message.content
         return ensure_json(raw)
     except Exception as e:
         # Best-effort fallback: return a heuristic result
@@ -277,6 +311,21 @@ with st.sidebar:
     use_llm = st.toggle("Use LLM (OpenAI)", value=USE_LLM_DEFAULT)
     model = st.text_input("Model", MODEL_DEFAULT)
     pii = st.toggle("Scrub PII before evaluation", value=True)
+
+    # Key/provider status
+    has_openai_key = bool(os.getenv("OPENAI_API_KEY"))
+    has_groq_key = bool(os.getenv("GROQ_API_KEY"))
+    if use_llm:
+        if has_groq_key and GROQ_SDK_AVAILABLE:
+            st.markdown(f"✅ LLM provider: **Groq** (key detected) — Model: `{model}`")
+        elif has_openai_key and OPENAI_AVAILABLE:
+            st.markdown(f"✅ LLM provider: **OpenAI** (key detected) — Model: `{model}`")
+        elif has_groq_key and not GROQ_SDK_AVAILABLE:
+            st.markdown("⚠️ Groq key set, but `groq` SDK not installed. Running heuristic if LLM call fails.")
+        elif has_openai_key and not OPENAI_AVAILABLE:
+            st.markdown("⚠️ OpenAI key set, but `openai` SDK not installed. Running heuristic if LLM call fails.")
+        else:
+            st.markdown("❌ No LLM key found — using heuristic scoring.")
 
     st.subheader("Scoring Weights")
     impact = st.slider("Impact/Outcomes", 0, 100, 25)
@@ -315,7 +364,7 @@ if run:
                 try:
                     raw_text = extract_text(upload)
                     resume_text = scrub_pii(raw_text) if pii else raw_text
-                    if use_llm and OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY"):
+                    if use_llm and ((OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY")) or (GROQ_SDK_AVAILABLE and os.getenv("GROQ_API_KEY"))):
                         r = call_openai(job_desc, resume_text, weights, model)
                     else:
                         r = heuristic_score(resume_text, KEYWORD_DEFAULTS, job_desc)
@@ -367,3 +416,5 @@ if results:
     st.download_button("Download CSV", data=csv, file_name="cv_scores.csv", mime="text/csv")
 
 st.caption("Tip: Add role-specific keywords to the heuristic, or keep LLM enabled for nuanced scoring.")
+
+
