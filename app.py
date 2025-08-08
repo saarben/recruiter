@@ -38,6 +38,12 @@ except Exception:
 import httpx
 from bs4 import BeautifulSoup
 
+# Default model selection: prefer Groq llama if GROQ_API_KEY present
+MODEL_DEFAULT = (
+    os.getenv("CV_SCREENER_MODEL")
+    or ("llama3-8b-8192" if os.getenv("GROQ_API_KEY") else "gpt-4o-mini")
+)
+
 MIN_JD_CHARS = 80
 
 def _extract_main_text_from_html(html: str) -> str:
