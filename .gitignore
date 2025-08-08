@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Environments
+.venv/
+venv/
+env/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# OS / Editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Streamlit secrets (keep out of git)
+.streamlit/secrets.toml
+
+# Env files / secrets (keep out of git)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+
+# Local run scripts (may contain secrets)
+run_app.bat
+*.local.bat
+
+# Caches
+.cache/ 
