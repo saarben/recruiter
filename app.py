@@ -6,6 +6,7 @@ import time
 import base64
 from typing import List, Dict, Any
 import tempfile
+import textwrap
 
 import streamlit as st
 import pandas as pd
@@ -33,6 +34,9 @@ try:
     GROQ_SDK_AVAILABLE = True
 except Exception:
     GROQ_SDK_AVAILABLE = False
+
+import httpx
+from bs4 import BeautifulSoup
 
 MODEL_DEFAULT = (
     os.getenv("CV_SCREENER_MODEL")
@@ -81,6 +85,27 @@ JSON_SCHEMA = {
     "required": ["overall_score", "hire_recommendation"],
     "additionalProperties": True
 }
+
+def fetch_jd_from_url(url: str, timeout: float = 10.0) -> str:
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; CV-Screener/1.0)"}
+        with httpx.Client(follow_redirects=True, timeout=timeout) as client:
+            resp = client.get(url, headers=headers)
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            text = resp.text
+        if "html" in content_type.lower() or "<html" in text.lower():
+            soup = BeautifulSoup(text, "html.parser")
+            # Remove scripts/styles
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            page_text = soup.get_text(separator="\n")
+            # Normalize whitespace
+            cleaned = "\n".join(line.strip() for line in page_text.splitlines() if line.strip())
+            return cleaned[:20000]
+        return text[:20000]
+    except Exception as e:
+        return f"(Failed to fetch JD from URL: {e})"
 
 # LLM client factory: supports OpenAI (default) or Groq SDK
 def create_llm_client():
@@ -168,12 +193,13 @@ def scrub_pii(text: str) -> str:
         scrubbed = re.sub(pat, "[REDACTED]", scrubbed, flags=re.IGNORECASE)
     return scrubbed
 
-def heuristic_score(text: str, keywords: List[str], job_desc: str) -> Dict[str, Any]:
+def heuristic_score(text: str, keywords: List[str], job_desc: str, reference_texts: List[str] | None = None) -> Dict[str, Any]:
     """Heuristic scoring that incorporates JD terms.
 
     - Extracts salient keywords from the job description
     - Counts unique JD term matches and default keyword hits in the resume
-    - Combines JD matches, defaults, and years of experience into a 0-100 score
+    - Incorporates reference CV keywords if provided
+    - Combines JD matches, references, defaults, and years of experience into a 0-100 score
     """
     def tokenize_keywords(source_text: str) -> List[str]:
         tokens = re.findall(r"[A-Za-z][A-Za-z0-9+\-#\.]{1,}", source_text.lower())
@@ -187,9 +213,18 @@ def heuristic_score(text: str, keywords: List[str], job_desc: str) -> Dict[str, 
         return [k for k, _ in top[:30]]
 
     jd_keywords: List[str] = tokenize_keywords(job_desc) if job_desc else []
+    ref_keywords: List[str] = []
+    if reference_texts:
+        for rt in reference_texts:
+            ref_keywords.extend(tokenize_keywords(rt))
+        # Keep top distinct reference terms
+        ref_freqs: Dict[str, int] = {}
+        for rk in ref_keywords:
+            ref_freqs[rk] = ref_freqs.get(rk, 0) + 1
+        ref_keywords = [k for k, _ in sorted(ref_freqs.items(), key=lambda kv: kv[1], reverse=True)[:30]]
     combined_keywords: List[str] = []
     seen: set[str] = set()
-    for k in (jd_keywords + keywords):
+    for k in (jd_keywords + ref_keywords + keywords):
         if k not in seen:
             combined_keywords.append(k)
             seen.add(k)
@@ -206,15 +241,18 @@ def heuristic_score(text: str, keywords: List[str], job_desc: str) -> Dict[str, 
     default_hits_total = sum(count_hits(text, k) for k in keywords)
     jd_unique_hits = sum(1 for k in jd_keywords if count_hits(text, k) > 0)
     jd_total_hits = sum(count_hits(text, k) for k in jd_keywords)
+    ref_unique_hits = sum(1 for k in ref_keywords if count_hits(text, k) > 0)
+    ref_total_hits = sum(count_hits(text, k) for k in ref_keywords)
 
     year_hits = re.findall(r"(\d{1,2})\+?\s*(?:years|yrs)", text, flags=re.IGNORECASE)
     years = max([int(y) for y in year_hits], default=0)
 
-    # Weighted components: JD emphasis
-    jd_component = min(50, jd_unique_hits * 5)  # up to 50
-    default_component = min(30, default_hits_total * 3)  # up to 30
-    years_component = min(20, years * 4)  # up to 20
-    score = min(100, jd_component + default_component + years_component)
+    # Weighted components: JD emphasis + references
+    jd_component = min(40, jd_unique_hits * 4)  # up to 40
+    ref_component = min(30, ref_unique_hits * 3)  # up to 30
+    default_component = min(20, default_hits_total * 2)  # up to 20
+    years_component = min(10, years * 2)  # up to 10
+    score = min(100, jd_component + ref_component + default_component + years_component)
 
     rec = "no"
     if score >= 85:
@@ -225,17 +263,21 @@ def heuristic_score(text: str, keywords: List[str], job_desc: str) -> Dict[str, 
         rec = "maybe"
 
     matched_jd_terms = [k for k in jd_keywords if count_hits(text, k) > 0][:10]
+    matched_ref_terms = [k for k in ref_keywords if count_hits(text, k) > 0][:10]
 
     return {
         "name": "(unknown)",
         "overall_score": score,
         "fit_reasoning": (
             f"JD unique term matches: {jd_unique_hits}/{len(jd_keywords)}; "
-            f"JD total hits: {jd_total_hits}; Default keyword hits: {default_hits_total}; "
+            f"JD total hits: {jd_total_hits}; Ref matches: {ref_unique_hits}/{len(ref_keywords)} (total {ref_total_hits}); "
+            f"Default keyword hits: {default_hits_total}; "
             f"Estimated years: {years}."
         ),
         "pros": [
-            f"Matched JD terms: {', '.join(matched_jd_terms)}" if matched_jd_terms else "Some baseline keyword matches",
+            f"Matched JD terms: {', '.join(matched_jd_terms)}" if matched_jd_terms else None,
+            f"Matched reference terms: {', '.join(matched_ref_terms)}" if matched_ref_terms else None,
+            "Some baseline keyword matches",
         ],
         "cons": ["Heuristic; may miss nuanced fit"],
         "hire_recommendation": rec,
@@ -257,7 +299,7 @@ def ensure_json(text: str) -> Dict[str, Any]:
         except Exception:
             pass
     # Trailing object from the end
-    m = re.search(r"\{[\s\s]*\}$", s)
+    m = re.search(r"\{[\s\S]*\}$", s)
     if m:
         candidate = m.group(0)
         try:
@@ -274,7 +316,7 @@ def ensure_json(text: str) -> Dict[str, Any]:
     return json.loads(s)
 
 # LLM call using OpenAI-compatible client (OpenAI or Groq)
-def call_openai(job_desc: str, resume_text: str, weights: Dict[str, int], model: str) -> Dict[str, Any]:
+def call_openai(job_desc: str, resume_text: str, weights: Dict[str, int], model: str, reference_summaries: str = "") -> Dict[str, Any]:
     if not OPENAI_AVAILABLE:
         # We'll still allow Groq path even if OpenAI is missing
         if not (os.getenv("GROQ_API_KEY") and GROQ_SDK_AVAILABLE):
@@ -295,6 +337,8 @@ def call_openai(job_desc: str, resume_text: str, weights: Dict[str, int], model:
 Evaluate the following candidate against this job description.
 
 JOB DESCRIPTION:\n{job_desc}\n\nRESUME:\n{resume_text}\n\nScoring rubric weights (sum to 100):\n- Impact/Outcomes: {rubric['impact_weight']}\n- Skills/Tech match: {rubric['skills_weight']}\n- Relevant experience: {rubric['experience_weight']}\n- Culture/communication: {rubric['culture_weight']}\n
+Reference profiles (strong team members, guide ideal fit):\n{reference_summaries}
+
 Return a JSON with keys: name (if present), overall_score (0-100), fit_reasoning, pros[], cons[], hire_recommendation (one of: strong yes, yes, maybe, no), risk_flags[], years_experience (estimate). Keep JSON concise.
 """
 
@@ -368,9 +412,21 @@ with st.sidebar:
     weights = {"impact": impact, "skills": skills, "experience": experience, "culture": culture}
 
 st.subheader("Job Description")
-job_desc = st.text_area("Paste the role description / must-haves / nice-to-haves", height=200)
+jd_col1, jd_col2 = st.columns([3, 1])
+with jd_col1:
+    job_desc = st.text_area("Paste the role description / must-haves / nice-to-haves", height=200)
+with jd_col2:
+    jd_url = st.text_input("Or paste JD URL")
+    if jd_url:
+        fetched = fetch_jd_from_url(jd_url)
+        if fetched.startswith("(Failed to fetch JD"):
+            st.warning(fetched)
+        else:
+            st.success("Fetched JD from URL. Populated the text area.")
+            job_desc = fetched
 
-uploads = st.file_uploader("Upload CVs (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"], accept_multiple_files=True)
+uploads = st.file_uploader("Upload candidate CVs (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"], accept_multiple_files=True)
+ref_uploads = st.file_uploader("Upload reference CVs (strong existing team members)", type=["pdf", "docx", "txt"], accept_multiple_files=True, key="ref")
 
 colA, colB = st.columns([1,1])
 with colA:
@@ -381,6 +437,13 @@ with colB:
         st.experimental_rerun()
 
 results: List[Dict[str, Any]] = []
+reference_texts: List[str] = []
+if ref_uploads:
+    for ref in ref_uploads:
+        try:
+            reference_texts.append(extract_text(ref))
+        except Exception:
+            pass
 
 if run:
     if not job_desc:
@@ -393,10 +456,13 @@ if run:
                 try:
                     raw_text = extract_text(upload)
                     resume_text = scrub_pii(raw_text) if pii else raw_text
+                    ref_summary = ""
+                    if reference_texts:
+                        ref_summary = textwrap.shorten("\n\n".join(reference_texts), width=4000, placeholder="…")
                     if use_llm and ((OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY")) or (GROQ_SDK_AVAILABLE and os.getenv("GROQ_API_KEY"))):
-                        r = call_openai(job_desc, resume_text, weights, model)
+                        r = call_openai(job_desc, resume_text, weights, model, reference_summaries=ref_summary)
                     else:
-                        r = heuristic_score(resume_text, KEYWORD_DEFAULTS, job_desc)
+                        r = heuristic_score(resume_text, KEYWORD_DEFAULTS, job_desc, reference_texts=reference_texts)
                     r["file"] = upload.name
                     results.append(r)
                 except Exception as e:
@@ -430,7 +496,7 @@ if results:
                 st.markdown(f"**Score:** {int(row['overall_score'])} | **Recommendation:** {row['hire_recommendation']} | **Years exp (est):** {row.get('years_experience', 0)}")
                 if row.get("pros"):
                     st.markdown("**Pros:**")
-                    st.write(row["pros"])
+                    st.write([p for p in row["pros"] if p])
                 if row.get("cons"):
                     st.markdown("**Cons:**")
                     st.write(row["cons"])
@@ -444,6 +510,6 @@ if results:
     csv = df_sorted.to_csv(index=False).encode()
     st.download_button("Download CSV", data=csv, file_name="cv_scores.csv", mime="text/csv")
 
-st.caption("Tip: Add role-specific keywords to the heuristic, or keep LLM enabled for nuanced scoring.")
+st.caption("Tip: Paste a JD URL, add reference CVs for guidance, tweak weights, and enable LLM for nuanced scoring.")
 
 

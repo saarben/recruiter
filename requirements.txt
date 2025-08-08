@@ -6,3 +6,4 @@ docx2txt==0.8
 openai==1.43.0
 groq==0.8.0
 httpx==0.26.0
+beautifulsoup4==4.12.3
